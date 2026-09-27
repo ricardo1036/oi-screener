@@ -27,7 +27,7 @@ import requests
 # ==============================================================================
 class Config:
     # --- Binance ---
-    BINANCE_BASE = "https://data-api.binance.vision"
+    BINANCE_BASE = "https://fapi.binance.com"
 
     # --- Telegram (usa variables de entorno en producción, nunca hardcodees
     #     tu token/chat_id si vas a subir el código a un repo público) ---
