@@ -27,7 +27,7 @@ import requests
 # ==============================================================================
 class Config:
     # --- Binance ---
-    BINANCE_BASE = "https://fapi1.binance.com"
+    BINANCE_BASE = "https://data-api.binance.vision"
 
     # --- Telegram (usa variables de entorno en producción, nunca hardcodees
     #     tu token/chat_id si vas a subir el código a un repo público) ---
@@ -79,7 +79,7 @@ log = logging.getLogger("oi_monitor")
 # ESTADO GLOBAL (en memoria)
 # ==============================================================================
 session = requests.Session()
-session.headers.update({"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"})
+session.headers.update({"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36","Accept-Encoding": "gzip, deflate"})
 
 symbols_lock = threading.Lock()
 active_symbols = []          # lista de pares filtrados (top N por volumen)
