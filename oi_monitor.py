@@ -3,15 +3,32 @@
 ================================================================================
  BINANCE FUTURES MONITOR BOT - OI + Volumen (WebSocket + REST híbrido)
 ================================================================================
-Arquitectura:
-  - WebSocket (wss://fstream.binance.com) -> velas de 1 minuto en tiempo real
-    para detectar spikes de volumen y calcular RVOL (sin gastar peso REST).
-  - REST API pública -> Open Interest, consultado en bucle secuencial con
-    pausa fija entre requests para evitar rate limits (HTTP 418/429).
-  - Telegram con DOS canales: uno urgente (con sonido) para spikes de
-    volumen explosivos, y uno informativo (silencioso) para OI y RVOL.
+Arquitectura (2 capas):
 
-No usa API Keys privadas: solo endpoints públicos de Binance Futuros.
+  CAPA 1 — ¿Qué monedas vigilo? (universo dinámico)
+    Se construye a partir de CoinMarketCap (listings/latest): se filtran las
+    monedas dentro de una BANDA de capitalización de mercado configurable
+    (ej. $50M-$500M), se cruzan contra los pares realmente disponibles en
+    Binance Futuros USDT-M, y se exige liquidez mínima (piso absoluto de
+    volumen 24h + ratio Volumen/Market Cap). El match símbolo->proyecto es
+    CONSERVADOR: si un ticker es ambiguo (varios proyectos lo comparten), se
+    descarta en vez de arriesgarse a monitorear el proyecto equivocado.
+    Este universo se refresca en horas ANCLADAS de reloj (UTC), no por
+    intervalo relativo al arranque del bot, para garantizar que esté fresco
+    antes de ventanas horarias específicas (ej. antes de la apertura de NY).
+
+  CAPA 2 — ¿Está pasando algo interesante AHORA en esas monedas?
+    - WebSocket (wss://fstream.binance.com) -> velas de 1 minuto en tiempo
+      real para detectar spikes de volumen y RVOL de corto plazo, sin gastar
+      peso de la API REST de Binance.
+    - REST pública de Binance -> Open Interest, consultado en bucle
+      secuencial con pausa fija entre requests (anti rate-limit).
+    - Telegram con DOS canales: uno urgente (con sonido) para spikes de
+      volumen explosivos, y uno informativo (silencioso) para OI y RVOL.
+
+No usa API Keys privadas de Binance: solo endpoints públicos de Futuros.
+Sí requiere una API Key gratuita de CoinMarketCap (CMC_API_KEY) para poder
+construir el universo por capitalización de mercado.
 No es asesoría financiera. Uso bajo tu propia responsabilidad.
 ================================================================================
 """
@@ -22,6 +39,7 @@ import time
 import logging
 import threading
 from collections import deque
+from datetime import datetime, timezone, timedelta
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import requests
@@ -52,11 +70,41 @@ class Config:
     WS_BASE = "wss://fstream.binance.com/stream"
 
     # ---------------------------------------------------------------------
-    # FILTRADO DINÁMICO DE PARES
+    # COINMARKETCAP — requiere API Key gratuita (pro-api, plan Basic).
+    # Regístrate en https://coinmarketcap.com/api/ y pon la key como
+    # variable de entorno CMC_API_KEY en tu servidor.
     # ---------------------------------------------------------------------
-    TOP_N_PAIRS = 200                 # cuántos pares monitorear como máximo
-    MIN_VOLUME_USD = 10_000_000       # descarta pares con menos de $10M vol 24h
-    SYMBOL_REFRESH_INTERVAL = 6 * 60 * 60   # refrescar lista de pares cada 6h
+    CMC_API_KEY = os.environ.get("CMC_API_KEY", "")
+    CMC_BASE = "https://pro-api.coinmarketcap.com"
+
+    # ---------------------------------------------------------------------
+    # CAPA 1 — UNIVERSO POR BANDA DE CAPITALIZACIÓN DE MERCADO
+    # ---------------------------------------------------------------------
+    # Banda de market cap a monitorear (ajustable sin tocar lógica).
+    MIN_MARKET_CAP_USD = 50_000_000
+    MAX_MARKET_CAP_USD = 500_000_000
+
+    # Filtro de liquidez en Binance Futuros (red de seguridad, no el criterio
+    # principal): piso absoluto en USD + ratio mínimo Volumen24h/MarketCap.
+    MIN_BINANCE_VOLUME_USD = 3_000_000
+    MIN_VOLUME_TO_MCAP_RATIO = 0.05   # 5%: al menos ese % del cap se "rota" en 24h
+
+    # Tamaño del universo descargado de CoinMarketCap antes de filtrar por
+    # banda (grande a propósito: la banda puede caer en cualquier ranking).
+    MARKET_UNIVERSE_FETCH_LIMIT = 5000
+
+    # Horas de reloj UTC en las que se refresca el universo (qué monedas se
+    # monitorean). Ancladas a reloj -no a "cada N horas desde el arranque"-
+    # para garantizar frescura antes de ventanas horarias específicas.
+    # Por defecto: cada 6h, con una justo ~2.5-3.5h antes de la apertura de
+    # Nueva York durante todo el año (11:00 UTC), sin necesidad de ajustarla
+    # por cambios de horario (ni de Chile ni de EE.UU.).
+    UNIVERSE_REFRESH_HOURS_UTC = [5, 11, 17, 23]
+
+    # Cache del VALOR de Market Cap mostrado en las alertas (no cambia qué
+    # monedas se monitorean, solo mantiene el número fresco). Este sí puede
+    # ser un intervalo simple, no necesita anclarse a horas de reloj.
+    MARKET_CAP_DISPLAY_REFRESH_INTERVAL = 30 * 60
 
     # ---------------------------------------------------------------------
     # OPEN INTEREST — frecuencia de consulta y pausa anti rate-limit
@@ -66,8 +114,7 @@ class Config:
     OI_HISTORY_MAXLEN = 300           # ~25h de histórico a razón de 1 muestra/5min
 
     # Umbrales de variación de OI, evaluados de forma INDEPENDIENTE por
-    # temporalidad. Si se cumple cualquiera de ellos, se dispara la alerta
-    # indicando cuál(es) temporalidad(es) la activaron.
+    # temporalidad. Solo se dispara ante SUBIDAS (acumulación), nunca caídas.
     OI_THRESHOLD_5M = 3.0
     OI_THRESHOLD_15M = 5.0
     OI_THRESHOLD_30M = 7.0
@@ -78,14 +125,20 @@ class Config:
     # ---------------------------------------------------------------------
     # DETECTOR DE SPIKES DE VOLUMEN EN VELAS DE 1 MINUTO (canal urgente)
     # ---------------------------------------------------------------------
-    VOL_SPIKE_THRESHOLD_PCT = 300     # % de exceso sobre el promedio para alertar
-    LOOKBACK_BARS_1M = 20             # nº de velas previas usadas como referencia
+    VOL_SPIKE_THRESHOLD_PCT = 150     # % de exceso sobre el promedio para alertar
+    LOOKBACK_BARS_1M = 10             # nº de velas previas usadas como referencia
 
     # ---------------------------------------------------------------------
-    # DETECTOR DE RVOL (Volumen Relativo) — canal info
+    # DETECTOR DE RVOL — Volumen Relativo de CORTO PLAZO (canal info)
     # ---------------------------------------------------------------------
+    # A propósito NO es RVOL "de sesión" (hoy vs. misma hora de ayer): esa
+    # variante exige guardar varios días de historial minuto a minuto y se
+    # resetea en cada reinicio (el bot no tiene almacenamiento persistente).
+    # Esta versión de corto plazo detecta explosiones de volumen frente a
+    # los minutos inmediatamente anteriores, que es justo lo que se busca
+    # para cazar arranques de tendencia en scalping de 1 minuto.
     RVOL_WINDOW_BARS = 5              # tamaño de la ventana acumulada (minutos)
-    RVOL_THRESHOLD = 3.0              # dispara si RVOL >= 3.0x (300%) lo esperado
+    RVOL_THRESHOLD = 2.0              # dispara si RVOL >= 2.0x (200%) lo esperado
 
     # ---------------------------------------------------------------------
     # ANTI-SPAM (cooldowns independientes por tipo de alerta)
@@ -93,22 +146,6 @@ class Config:
     SPIKE_ALERT_COOLDOWN = 15 * 60
     OI_ALERT_COOLDOWN = 15 * 60
     RVOL_ALERT_COOLDOWN = 15 * 60
-
-    # ---------------------------------------------------------------------
-    # MARKET CAP (CoinGecko — API pública, sin API Key)
-    # ---------------------------------------------------------------------
-    # Binance no expone market cap (ni REST ni WebSocket), así que se
-    # obtiene de CoinGecko y se cachea en memoria. El match símbolo->moneda
-    # es CONSERVADOR: solo se acepta si el ticker es único entre las monedas
-    # descargadas; si hay ambigüedad (varios proyectos con el mismo ticker)
-    # o no se encuentra, esa alerta simplemente omite la línea de Market Cap
-    # (nunca detiene ni rompe el bot).
-    ENABLE_MARKET_CAP = True
-    COINGECKO_BASE = "https://api.coingecko.com/api/v3"
-    MARKET_CAP_REFRESH_INTERVAL = 45 * 60   # refrescar cache cada 45 min
-    MARKET_CAP_PAGES = 4                    # 4 páginas x 250 = top 1000 por market cap
-    MARKET_CAP_PAGE_SIZE = 250
-    MARKET_CAP_REQUEST_PAUSE = 1.5          # pausa entre páginas (cortesía API pública)
 
     # ---------------------------------------------------------------------
     # RED / ROBUSTEZ
@@ -149,10 +186,10 @@ logging.getLogger("websocket").setLevel(logging.WARNING)
 # ESTADO GLOBAL EN MEMORIA
 # ==============================================================================
 http_session = requests.Session()
-http_session.headers.update({"User-Agent": "futures-monitor-bot/2.0"})
+http_session.headers.update({"User-Agent": "futures-monitor-bot/3.0"})
 
 symbols_lock = threading.Lock()
-active_symbols = []                 # Top N pares filtrados (símbolos en mayúsculas)
+active_symbols = []                 # universo filtrado (banda de market cap + liquidez)
 
 oi_history = {}                     # symbol -> deque[(ts, oi_usdt)]
 kline_volume_history = {}           # symbol -> deque[quote_volume de velas cerradas]
@@ -165,7 +202,8 @@ last_rvol_alert = {}                # symbol -> ts último alert de RVOL
 current_ws_app = None               # referencia al WebSocketApp activo
 ws_restart_lock = threading.Lock()
 
-market_cap_cache = {}               # base_symbol (ej. "QNT") -> market cap USD
+market_cap_cache = {}               # binance_symbol -> market cap USD (para mostrar en alertas)
+symbol_cmc_id = {}                  # binance_symbol -> id de CoinMarketCap (para refrescos baratos/sin ambigüedad)
 market_cap_lock = threading.Lock()
 
 
@@ -192,23 +230,16 @@ def base_asset(symbol):
     return symbol[:-4] if symbol.endswith("USDT") else symbol
 
 
-def get_market_cap(symbol):
-    """Devuelve el market cap cacheado para un símbolo, o None si no hay
-    match único/confiable en CoinGecko (nunca lanza error, nunca bloquea)."""
-    with market_cap_lock:
-        return market_cap_cache.get(base_asset(symbol))
-
-
-def http_get_json(url, params=None):
+def http_get_json(url, params=None, headers=None):
     """GET con reintentos y backoff exponencial. Devuelve None si falla todo."""
     for attempt in range(1, Config.MAX_RETRIES + 1):
         try:
-            resp = http_session.get(url, params=params, timeout=Config.REQUEST_TIMEOUT)
+            resp = http_session.get(url, params=params, headers=headers, timeout=Config.REQUEST_TIMEOUT)
             if resp.status_code == 200:
                 return resp.json()
             if resp.status_code in (429, 418):
                 wait = Config.RETRY_BACKOFF_BASE ** attempt
-                log.warning("Rate limit Binance (status %s). Esperando %ss...", resp.status_code, wait)
+                log.warning("Rate limit (status %s) en %s. Esperando %ss...", resp.status_code, url, wait)
                 time.sleep(wait)
             else:
                 log.warning("Respuesta inesperada (status %s) en %s", resp.status_code, url)
@@ -271,9 +302,10 @@ def send_info_alert(text):
 
 
 # ==============================================================================
-# BINANCE REST: FILTRADO DINÁMICO DE PARES
+# BINANCE REST: exchangeInfo + tickers 24h (insumos para el universo y el OI)
 # ==============================================================================
 def fetch_exchange_info():
+    """Devuelve el set de símbolos USDT-M PERPETUAL actualmente TRADING en Binance."""
     data = http_get_json(f"{Config.REST_BASE}/fapi/v1/exchangeInfo")
     if not data:
         return None
@@ -304,104 +336,196 @@ def fetch_24h_tickers():
     return result
 
 
-def refresh_symbols():
-    """Actualiza la lista global de pares (Top N por volumen, >= MIN_VOLUME_USD).
-    Si la lista cambia, fuerza la reconexión del WebSocket con los nuevos streams."""
-    log.info("Refrescando lista de pares (exchangeInfo + volumen 24h)...")
+# ==============================================================================
+# COINMARKETCAP: universo por capitalización + cache de Market Cap
+# ==============================================================================
+def cmc_headers():
+    return {"X-CMC_PRO_API_KEY": Config.CMC_API_KEY, "Accept": "application/json"}
 
-    valid_symbols = fetch_exchange_info()
+
+def fetch_cmc_listings(limit):
+    """Descarga un lote grande de CoinMarketCap ordenado por market cap, para
+    poder filtrar después por banda (la banda puede caer en cualquier rango
+    de ranking, no necesariamente en el Top 200)."""
+    if not Config.CMC_API_KEY:
+        log.error("CMC_API_KEY no configurada. No se puede refrescar el universo.")
+        return None
+    data = http_get_json(
+        f"{Config.CMC_BASE}/v1/cryptocurrency/listings/latest",
+        params={"start": 1, "limit": limit, "convert": "USD"},
+        headers=cmc_headers(),
+    )
+    if not data:
+        return None
+    return data.get("data")
+
+
+def fetch_cmc_quotes_by_id(ids):
+    """Refresco barato y SIN ambigüedad: consulta por ID de CoinMarketCap
+    (único por definición), no por símbolo."""
+    if not ids or not Config.CMC_API_KEY:
+        return None
+    data = http_get_json(
+        f"{Config.CMC_BASE}/v1/cryptocurrency/quotes/latest",
+        params={"id": ",".join(str(i) for i in ids), "convert": "USD"},
+        headers=cmc_headers(),
+    )
+    if not data:
+        return None
+    return data.get("data")
+
+
+def refresh_universe():
+    """CAPA 1: reconstruye qué monedas se monitorean.
+    1) Descarga un lote grande de CoinMarketCap.
+    2) Descarta tickers ambiguos (varios proyectos con el mismo símbolo).
+    3) Filtra por banda de market cap.
+    4) Cruza contra los pares realmente activos en Binance Futuros USDT-M.
+    5) Exige liquidez mínima (piso absoluto + ratio Volumen/MarketCap).
+    Si algo falla, se mantiene el universo anterior (nunca se vacía por un
+    error puntual de red)."""
+    log.info("Refrescando universo por capitalización de mercado (CoinMarketCap)...")
+
+    listings = fetch_cmc_listings(Config.MARKET_UNIVERSE_FETCH_LIMIT)
+    valid_binance_symbols = fetch_exchange_info()
     tickers = fetch_24h_tickers()
-    if not valid_symbols or not tickers:
-        log.error("No se pudo refrescar la lista de pares. Se mantiene la anterior.")
+
+    if not listings or not valid_binance_symbols or not tickers:
+        log.error("No se pudo refrescar el universo (CMC/Binance no respondió). Se mantiene el anterior.")
         return
 
-    candidates = [
-        (s, tickers[s]["quote_volume"])
-        for s in valid_symbols
-        if s in tickers and tickers[s]["quote_volume"] >= Config.MIN_VOLUME_USD
-    ]
-    candidates.sort(key=lambda x: x[1], reverse=True)
-    new_symbols = [s for s, _ in candidates[: Config.TOP_N_PAIRS]]
+    # --- Agrupar por símbolo para detectar ambigüedad ---
+    symbol_entries = {}
+    for item in listings:
+        try:
+            sym = item["symbol"].upper()
+            cmc_id = item["id"]
+            mcap = item["quote"]["USD"]["market_cap"]
+            if mcap:
+                symbol_entries.setdefault(sym, []).append((cmc_id, mcap))
+        except (KeyError, TypeError):
+            continue
+
+    ambiguous_count = sum(1 for entries in symbol_entries.values() if len(entries) > 1)
+
+    # --- Solo tickers únicos y dentro de la banda de capitalización ---
+    band_candidates = {}
+    for sym, entries in symbol_entries.items():
+        if len(entries) != 1:
+            continue  # ambiguo: se descarta (match conservador)
+        cmc_id, mcap = entries[0]
+        if Config.MIN_MARKET_CAP_USD <= mcap <= Config.MAX_MARKET_CAP_USD:
+            band_candidates[sym] = (cmc_id, mcap)
+
+    # --- Intersección con Binance Futuros + filtro de liquidez ---
+    new_symbols = []
+    new_market_caps = {}
+    new_cmc_ids = {}
+
+    for binance_symbol in valid_binance_symbols:
+        base = base_asset(binance_symbol)
+        candidate = band_candidates.get(base)
+        if not candidate:
+            continue
+        cmc_id, mcap = candidate
+
+        t = tickers.get(binance_symbol)
+        if not t:
+            continue
+        binance_volume = t["quote_volume"]
+
+        if binance_volume < Config.MIN_BINANCE_VOLUME_USD:
+            continue
+
+        ratio = (binance_volume / mcap) if mcap > 0 else 0.0
+        if ratio < Config.MIN_VOLUME_TO_MCAP_RATIO:
+            continue
+
+        new_symbols.append(binance_symbol)
+        new_market_caps[binance_symbol] = mcap
+        new_cmc_ids[binance_symbol] = cmc_id
 
     with symbols_lock:
         global active_symbols
         changed = set(new_symbols) != set(active_symbols)
         active_symbols = new_symbols
 
-    log.info("Lista de pares actualizada: %s pares activos (de %s candidatos con volumen >= %s).",
-              len(new_symbols), len(candidates), format_usd(Config.MIN_VOLUME_USD))
+    with market_cap_lock:
+        global market_cap_cache, symbol_cmc_id
+        market_cap_cache = new_market_caps
+        symbol_cmc_id = new_cmc_ids
+
+    log.info(
+        "Universo actualizado: %s pares | banda $%s-$%s | ratio vol/mcap >= %.0f%% | "
+        "piso vol >= %s | %s tickers ambiguos descartados.",
+        len(new_symbols), format_usd(Config.MIN_MARKET_CAP_USD), format_usd(Config.MAX_MARKET_CAP_USD),
+        Config.MIN_VOLUME_TO_MCAP_RATIO * 100, format_usd(Config.MIN_BINANCE_VOLUME_USD), ambiguous_count,
+    )
 
     if changed:
         restart_websocket()
 
 
-# ==============================================================================
-# COINGECKO: MARKET CAP (cache en memoria, refresco periódico)
-# ==============================================================================
-def fetch_market_caps():
-    """Descarga varias páginas de CoinGecko (ordenadas por market cap) y arma
-    un diccionario símbolo -> market cap, aceptando SOLO los tickers únicos
-    (si un mismo ticker aparece en más de un proyecto, se descarta para evitar
-    asignar el market cap equivocado)."""
-    symbol_entries = {}  # símbolo -> lista de market caps encontrados (para detectar duplicados)
+def refresh_market_cap_display():
+    """Refresca SOLO el valor de Market Cap mostrado en las tarjetas de
+    Telegram, para los símbolos ya activos. No cambia qué monedas se
+    monitorean (eso lo hace refresh_universe). Usa ID de CMC: sin ambigüedad
+    posible porque el ID es único por definición."""
+    with market_cap_lock:
+        ids_by_symbol = dict(symbol_cmc_id)
 
-    for page in range(1, Config.MARKET_CAP_PAGES + 1):
-        data = http_get_json(
-            f"{Config.COINGECKO_BASE}/coins/markets",
-            params={
-                "vs_currency": "usd",
-                "order": "market_cap_desc",
-                "per_page": Config.MARKET_CAP_PAGE_SIZE,
-                "page": page,
-                "sparkline": "false",
-            },
-        )
-        if not data:
-            log.warning("CoinGecko: no se pudo obtener la página %s de market caps.", page)
+    if not ids_by_symbol:
+        return
+
+    unique_ids = sorted(set(ids_by_symbol.values()))
+    data = fetch_cmc_quotes_by_id(unique_ids)
+    if not data:
+        log.warning("No se pudo refrescar el cache de Market Cap. Se mantienen los valores anteriores.")
+        return
+
+    updated = {}
+    for symbol, cmc_id in ids_by_symbol.items():
+        entry = data.get(str(cmc_id))
+        if not entry:
+            continue
+        try:
+            updated[symbol] = entry["quote"]["USD"]["market_cap"]
+        except (KeyError, TypeError):
             continue
 
-        for item in data:
-            try:
-                sym = item["symbol"].upper()
-                mcap = item.get("market_cap")
-                if mcap:
-                    symbol_entries.setdefault(sym, []).append(mcap)
-            except (KeyError, TypeError):
-                continue
-
-        time.sleep(Config.MARKET_CAP_REQUEST_PAUSE)  # cortesía con la API pública
-
-    # Solo se aceptan tickers UNICOS entre todo lo descargado (match conservador)
-    unique_map = {sym: caps[0] for sym, caps in symbol_entries.items() if len(caps) == 1}
-    ambiguous_count = sum(1 for caps in symbol_entries.values() if len(caps) > 1)
-    if ambiguous_count:
-        log.info("CoinGecko: %s tickers ambiguos descartados (varios proyectos comparten símbolo).",
-                  ambiguous_count)
-    return unique_map
-
-
-def refresh_market_caps():
-    if not Config.ENABLE_MARKET_CAP:
-        return
-    log.info("Refrescando cache de Market Cap (CoinGecko)...")
-    new_map = fetch_market_caps()
-    if not new_map:
-        log.warning("No se pudo refrescar Market Cap. Se mantiene el cache anterior.")
-        return
     with market_cap_lock:
-        global market_cap_cache
-        market_cap_cache = new_map
-    log.info("Cache de Market Cap actualizado: %s símbolos con match único.", len(new_map))
+        market_cap_cache.update(updated)
+
+    log.info("Cache de Market Cap (display) actualizado: %s símbolos.", len(updated))
 
 
-def run_market_cap_refresher():
-    """Hilo de fondo: refresca el cache de Market Cap cada MARKET_CAP_REFRESH_INTERVAL."""
+def get_market_cap(symbol):
+    with market_cap_lock:
+        return market_cap_cache.get(symbol)
+
+
+def run_market_cap_display_refresher():
+    """Hilo de fondo: refresca el valor de Market Cap cada MARKET_CAP_DISPLAY_REFRESH_INTERVAL."""
     while True:
         try:
-            refresh_market_caps()
+            refresh_market_cap_display()
         except Exception as e:
-            log.exception("Error refrescando Market Cap: %s", e)
-        time.sleep(Config.MARKET_CAP_REFRESH_INTERVAL)
+            log.exception("Error refrescando Market Cap (display): %s", e)
+        time.sleep(Config.MARKET_CAP_DISPLAY_REFRESH_INTERVAL)
+
+
+def next_universe_refresh_after(dt):
+    """Devuelve el próximo datetime UTC (de UNIVERSE_REFRESH_HOURS_UTC)
+    estrictamente posterior a dt. Anclar a horas de reloj (en vez de 'cada N
+    horas desde el arranque') garantiza frescura antes de ventanas horarias
+    específicas, sin importar cuándo se reinicie el bot."""
+    candidates = []
+    for h in Config.UNIVERSE_REFRESH_HOURS_UTC:
+        candidate = dt.replace(hour=h, minute=0, second=0, microsecond=0)
+        if candidate <= dt:
+            candidate += timedelta(days=1)
+        candidates.append(candidate)
+    return min(candidates)
 
 
 # ==============================================================================
@@ -432,6 +556,26 @@ def evaluate_oi_timeframes(symbol, hist, oi_usdt):
     return triggered
 
 
+def compute_rvol_1m(symbol):
+    """RVOL 'Fórmula Tipo 1': volumen de la ÚLTIMA vela cerrada de 1m vs. el
+    promedio de las LOOKBACK_BARS_1M velas inmediatamente anteriores (la
+    misma lógica que usa el detector de spikes). Devuelve None si todavía no
+    hay historial suficiente (ej. tras un reinicio reciente del bot), para
+    que la tarjeta de alerta simplemente omita esa línea."""
+    with kline_lock:
+        hist = kline_volume_history.get(symbol)
+        if not hist or len(hist) < Config.LOOKBACK_BARS_1M + 1:
+            return None
+        snapshot = list(hist)
+
+    last_bar = snapshot[-1]
+    reference = snapshot[-(Config.LOOKBACK_BARS_1M + 1):-1]
+    avg = sum(reference) / len(reference)
+    if avg <= 0:
+        return None
+    return last_bar / avg
+
+
 def process_symbol_oi(symbol, price, quote_volume):
     oi_contracts = fetch_open_interest(symbol)
     if oi_contracts is None:
@@ -453,10 +597,17 @@ def process_symbol_oi(symbol, price, quote_volume):
 
     # Todas las alertas triggered son subidas (ver evaluate_oi_timeframes), así
     # que el marcador siempre es verde.
-    lines = "\n".join(f"• *{label}:* 🟢+{chg:.2f}%" for label, chg in triggered)
+    lines = "\n".join(f"• *{label}:* 🟢 +{chg:.2f}%" for label, chg in triggered)
 
     mcap = get_market_cap(symbol)
     mcap_line = f"*Market Cap:* {format_usd(mcap)}\n" if mcap else ""
+
+    # Ratio OI/Volumen 24h: qué tan grande es el Open Interest en relación al
+    # volumen negociado en el día.
+    oi_vol_ratio = (oi_usdt / quote_volume * 100) if quote_volume > 0 else 0.0
+
+    rvol_1m = compute_rvol_1m(symbol)
+    rvol_line = f"*RVOL (1m):* {rvol_1m:.2f}x\n" if rvol_1m is not None else ""
 
     msg = (
         f"📈 *ALERTA DE OPEN INTEREST (Acumulación)*\n\n"
@@ -464,8 +615,10 @@ def process_symbol_oi(symbol, price, quote_volume):
         f"*Temporalidad(es) activada(s):*\n{lines}\n\n"
         f"*OI Actual:* {format_usd(oi_usdt)}\n"
         f"{mcap_line}"
-        f"*Volumen 24h:* {format_usd(quote_volume)}\n\n"
-        f"📊 [Ver en TradingView]({tradingview_link(symbol)})"
+        f"*Volumen 24h:* {format_usd(quote_volume)}\n"
+        f"*Ratio OI/Vol:* {oi_vol_ratio:.1f}%\n"
+        f"{rvol_line}"
+        f"\n📊 [Ver en TradingView]({tradingview_link(symbol)})"
     )
     if send_info_alert(msg):
         last_oi_alert[symbol] = now
@@ -474,7 +627,7 @@ def process_symbol_oi(symbol, price, quote_volume):
 
 def check_oi_cycle():
     """Recorre TODOS los pares activos de forma SECUENCIAL, con una pausa fija
-    entre cada request para evitar bloqueos/HTTP 418 de Binance."""
+    entre cada request para evitar bloqueos/HTTP 418/429 de Binance."""
     with symbols_lock:
         symbols_snapshot = list(active_symbols)
 
@@ -505,7 +658,7 @@ def check_oi_cycle():
 
 
 # ==============================================================================
-# WEBSOCKET: VELAS DE 1 MINUTO (spikes de volumen + RVOL)
+# WEBSOCKET: VELAS DE 1 MINUTO (spikes de volumen + RVOL de corto plazo)
 # ==============================================================================
 def build_stream_url(symbols):
     streams = "/".join(f"{s.lower()}@kline_1m" for s in symbols)
@@ -513,9 +666,9 @@ def build_stream_url(symbols):
 
 
 def evaluate_volume_bar(symbol, quote_volume):
-    """Corrige el bug de la media siempre en ~1.01x: usa el histórico REAL de
-    barras cerradas guardado en memoria (deque), calculado ANTES de insertar
-    la barra actual, en vez de una media móvil actualizada incorrectamente."""
+    """Usa el histórico REAL de barras cerradas guardado en memoria (deque),
+    calculado ANTES de insertar la barra actual (nunca se compara una vela
+    consigo misma)."""
     with kline_lock:
         hist = kline_volume_history.setdefault(
             symbol, deque(maxlen=max(Config.LOOKBACK_BARS_1M, Config.RVOL_WINDOW_BARS) + 5)
@@ -545,7 +698,7 @@ def evaluate_volume_bar(symbol, quote_volume):
                         last_spike_alert[symbol] = now
                         log.info("Alerta SPIKE enviada -> %s | +%.0f%%", symbol, spike_pct)
 
-            # ---------------- RVOL DETECTOR (canal info) ----------------
+            # ---------------- RVOL DETECTOR corto plazo (canal info) ----------------
             if len(hist_snapshot) >= Config.RVOL_WINDOW_BARS - 1:
                 window = hist_snapshot[-(Config.RVOL_WINDOW_BARS - 1):] + [quote_volume]
                 actual_sum = sum(window)
@@ -671,7 +824,13 @@ def start_health_server():
 # LOOP PRINCIPAL
 # ==============================================================================
 def main():
-    log.info("=== Iniciando Binance Futures Monitor Bot (WebSocket + REST) ===")
+    log.info("=== Iniciando Binance Futures Monitor Bot (universo por market cap + WebSocket + REST) ===")
+    log.info(
+        "Universo: banda $%s-$%s | ratio vol/mcap >= %.0f%% | piso vol >= %s | anclas UTC %s",
+        format_usd(Config.MIN_MARKET_CAP_USD), format_usd(Config.MAX_MARKET_CAP_USD),
+        Config.MIN_VOLUME_TO_MCAP_RATIO * 100, format_usd(Config.MIN_BINANCE_VOLUME_USD),
+        Config.UNIVERSE_REFRESH_HOURS_UTC,
+    )
     log.info(
         "Spike: >=%.0f%% sobre %s velas | RVOL: >=%.1fx sobre %s velas | "
         "OI umbrales 5m/15m/30m/1h/4h/24h = %.1f/%.1f/%.1f/%.1f/%.1f/%.1f %%",
@@ -684,27 +843,26 @@ def main():
     if Config.ENABLE_HEALTH_SERVER:
         threading.Thread(target=start_health_server, daemon=True).start()
 
-    refresh_symbols()  # primera carga de pares (dispara conexión WS más abajo)
+    refresh_universe()  # primera carga del universo (dispara conexión WS más abajo)
 
     threading.Thread(target=run_websocket_forever, daemon=True).start()
-
-    if Config.ENABLE_MARKET_CAP:
-        threading.Thread(target=run_market_cap_refresher, daemon=True).start()
+    threading.Thread(target=run_market_cap_display_refresher, daemon=True).start()
 
     send_info_alert("✅ *Futures Monitor Bot iniciado correctamente.*")
 
-    last_symbol_refresh = time.time()
+    next_universe_refresh = next_universe_refresh_after(datetime.now(timezone.utc))
     last_oi_check = 0  # forzar primera ejecución inmediata
 
     while True:
         try:
-            now = time.time()
+            now_dt = datetime.now(timezone.utc)
+            now_ts = time.time()
 
-            if now - last_symbol_refresh >= Config.SYMBOL_REFRESH_INTERVAL:
-                refresh_symbols()
-                last_symbol_refresh = now
+            if now_dt >= next_universe_refresh:
+                refresh_universe()
+                next_universe_refresh = next_universe_refresh_after(now_dt)
 
-            if now - last_oi_check >= Config.OI_CHECK_INTERVAL:
+            if now_ts - last_oi_check >= Config.OI_CHECK_INTERVAL:
                 check_oi_cycle()
                 last_oi_check = time.time()
 
