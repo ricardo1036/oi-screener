@@ -110,7 +110,7 @@ class Config:
     # OPEN INTEREST — frecuencia de consulta y pausa anti rate-limit
     # ---------------------------------------------------------------------
     OI_CHECK_INTERVAL = 5 * 60        # cada cuánto se recorren TODOS los pares
-    OI_REQUEST_PAUSE = 0.25           # pausa entre cada request de OI (segundos)
+    OI_REQUEST_PAUSE = 0.08           # pausa entre cada request de OI (segundos)
     OI_HISTORY_MAXLEN = 300           # ~25h de histórico a razón de 1 muestra/5min
 
     # Umbrales de variación de OI, evaluados de forma INDEPENDIENTE por
@@ -154,6 +154,24 @@ class Config:
     MAX_RETRIES = 3
     RETRY_BACKOFF_BASE = 2
 
+    # Tope de segundos a esperar cuando Binance/CMC indican el tiempo exacto
+    # de espera vía el header "Retry-After" (418/429). Según la documentación
+    # oficial de Binance, un baneo 418 puede durar de 2 minutos a 3 días; este
+    # tope evita que una sola llamada bloquee el bot por horas.
+    MAX_RETRY_AFTER_WAIT = 120
+
+    # Reintentos más pacientes para llamadas PESADAS de inicialización
+    # (exchangeInfo, listings de CoinMarketCap): se hacen pocas veces al día,
+    # así que no pasa nada si tardan más en recuperarse de un rate-limit.
+    HEAVY_MAX_RETRIES = 4
+    HEAVY_RETRY_BACKOFF = [5, 15, 30, 60]
+
+    # Si el universo queda vacío (ej. exchangeInfo falló en el arranque), se
+    # reintenta con backoff exponencial creciente en vez de esperar a la
+    # próxima hora ancla (que podría ser hasta 6h después).
+    EMPTY_UNIVERSE_RETRY_BASE = 120     # primer reintento: 2 min
+    EMPTY_UNIVERSE_RETRY_MAX = 1200     # tope: 20 min entre reintentos
+
     # Servidor HTTP mínimo (necesario para plataformas tipo Render que
     # exigen un puerto abierto en servicios "Web Service" + keep-alive)
     ENABLE_HEALTH_SERVER = True
@@ -186,7 +204,14 @@ logging.getLogger("websocket").setLevel(logging.WARNING)
 # ESTADO GLOBAL EN MEMORIA
 # ==============================================================================
 http_session = requests.Session()
-http_session.headers.update({"User-Agent": "futures-monitor-bot/3.0"})
+# Nota: este User-Agent es cosmético. Según la documentación oficial de
+# Binance, el HTTP 418 se dispara por volumen de requests por IP (no por
+# fingerprinting de cliente), así que esto no es "la solución" al rate
+# limit -no hace daño tenerlo, pero el fix real es honrar Retry-After.
+http_session.headers.update({
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                  "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+})
 
 symbols_lock = threading.Lock()
 active_symbols = []                 # universo filtrado (banda de market cap + liquidez)
@@ -230,24 +255,43 @@ def base_asset(symbol):
     return symbol[:-4] if symbol.endswith("USDT") else symbol
 
 
-def http_get_json(url, params=None, headers=None):
-    """GET con reintentos y backoff exponencial. Devuelve None si falla todo."""
-    for attempt in range(1, Config.MAX_RETRIES + 1):
+def _resolve_wait_time(resp, attempt, fallback_backoff):
+    """Decide cuánto esperar ante un 418/429: prioriza el header Retry-After
+    (Binance/CMC indican ahí el tiempo EXACTO necesario, incluyendo cuánto
+    falta para que termine un baneo 418) en vez de adivinar con un backoff
+    fijo. Si el header no viene, cae al backoff de respaldo."""
+    retry_after = resp.headers.get("Retry-After")
+    if retry_after:
+        try:
+            return min(float(retry_after), Config.MAX_RETRY_AFTER_WAIT)
+        except ValueError:
+            pass
+    return fallback_backoff[min(attempt - 1, len(fallback_backoff) - 1)]
+
+
+def http_get_json(url, params=None, headers=None, max_retries=None, fallback_backoff=None):
+    """GET con reintentos. Devuelve None si falla todo.
+    max_retries/fallback_backoff permiten dar más paciencia a llamadas
+    pesadas de inicialización (ver Config.HEAVY_MAX_RETRIES)."""
+    attempts = max_retries or Config.MAX_RETRIES
+    backoff = fallback_backoff or [Config.RETRY_BACKOFF_BASE ** i for i in range(1, attempts + 1)]
+
+    for attempt in range(1, attempts + 1):
         try:
             resp = http_session.get(url, params=params, headers=headers, timeout=Config.REQUEST_TIMEOUT)
             if resp.status_code == 200:
                 return resp.json()
             if resp.status_code in (429, 418):
-                wait = Config.RETRY_BACKOFF_BASE ** attempt
-                log.warning("Rate limit (status %s) en %s. Esperando %ss...", resp.status_code, url, wait)
+                wait = _resolve_wait_time(resp, attempt, backoff)
+                log.warning("Rate limit (status %s) en %s. Esperando %.0fs...", resp.status_code, url, wait)
                 time.sleep(wait)
             else:
                 log.warning("Respuesta inesperada (status %s) en %s", resp.status_code, url)
                 time.sleep(Config.RETRY_BACKOFF_BASE)
         except requests.exceptions.RequestException as e:
-            wait = Config.RETRY_BACKOFF_BASE ** attempt
+            wait = backoff[min(attempt - 1, len(backoff) - 1)]
             log.warning("Error de red (%s) en %s [intento %s/%s]. Reintentando en %ss...",
-                        e, url, attempt, Config.MAX_RETRIES, wait)
+                        e, url, attempt, attempts, wait)
             time.sleep(wait)
     log.error("Fallaron todos los reintentos para %s", url)
     return None
@@ -304,9 +348,11 @@ def send_info_alert(text):
 # ==============================================================================
 # BINANCE REST: exchangeInfo + tickers 24h (insumos para el universo y el OI)
 # ==============================================================================
-def fetch_exchange_info():
-    """Devuelve el set de símbolos USDT-M PERPETUAL actualmente TRADING en Binance."""
-    data = http_get_json(f"{Config.REST_BASE}/fapi/v1/exchangeInfo")
+def fetch_exchange_info(heavy=False):
+    """Devuelve el set de símbolos USDT-M PERPETUAL actualmente TRADING en Binance.
+    heavy=True usa el backoff más paciente (llamada de inicialización, poco frecuente)."""
+    kwargs = {"max_retries": Config.HEAVY_MAX_RETRIES, "fallback_backoff": Config.HEAVY_RETRY_BACKOFF} if heavy else {}
+    data = http_get_json(f"{Config.REST_BASE}/fapi/v1/exchangeInfo", **kwargs)
     if not data:
         return None
     symbols = set()
@@ -320,8 +366,10 @@ def fetch_exchange_info():
     return symbols
 
 
-def fetch_24h_tickers():
-    data = http_get_json(f"{Config.REST_BASE}/fapi/v1/ticker/24hr")
+def fetch_24h_tickers(heavy=False):
+    """heavy=True usa el backoff más paciente (llamada de inicialización, poco frecuente)."""
+    kwargs = {"max_retries": Config.HEAVY_MAX_RETRIES, "fallback_backoff": Config.HEAVY_RETRY_BACKOFF} if heavy else {}
+    data = http_get_json(f"{Config.REST_BASE}/fapi/v1/ticker/24hr", **kwargs)
     if not data:
         return None
     result = {}
@@ -354,6 +402,8 @@ def fetch_cmc_listings(limit):
         f"{Config.CMC_BASE}/v1/cryptocurrency/listings/latest",
         params={"start": 1, "limit": limit, "convert": "USD"},
         headers=cmc_headers(),
+        max_retries=Config.HEAVY_MAX_RETRIES,
+        fallback_backoff=Config.HEAVY_RETRY_BACKOFF,
     )
     if not data:
         return None
@@ -387,8 +437,8 @@ def refresh_universe():
     log.info("Refrescando universo por capitalización de mercado (CoinMarketCap)...")
 
     listings = fetch_cmc_listings(Config.MARKET_UNIVERSE_FETCH_LIMIT)
-    valid_binance_symbols = fetch_exchange_info()
-    tickers = fetch_24h_tickers()
+    valid_binance_symbols = fetch_exchange_info(heavy=True)
+    tickers = fetch_24h_tickers(heavy=True)
 
     if not listings or not valid_binance_symbols or not tickers:
         log.error("No se pudo refrescar el universo (CMC/Binance no respondió). Se mantiene el anterior.")
@@ -853,14 +903,48 @@ def main():
     next_universe_refresh = next_universe_refresh_after(datetime.now(timezone.utc))
     last_oi_check = 0  # forzar primera ejecución inmediata
 
+    # --- Red de seguridad: si el universo queda vacío (ej. exchangeInfo o
+    # CMC fallaron en el arranque), reintentar con backoff creciente en vez
+    # de esperar a la próxima hora ancla (que podría ser hasta 6h después). ---
+    empty_retry_wait = Config.EMPTY_UNIVERSE_RETRY_BASE
+    next_empty_retry = None
+    with symbols_lock:
+        if not active_symbols:
+            next_empty_retry = time.time() + empty_retry_wait
+            log.warning("Universo vacío tras el primer refresco. Reintentando en %ss...", empty_retry_wait)
+
     while True:
         try:
             now_dt = datetime.now(timezone.utc)
             now_ts = time.time()
 
-            if now_dt >= next_universe_refresh:
+            with symbols_lock:
+                universe_is_empty = not active_symbols
+
+            if universe_is_empty and next_empty_retry and now_ts >= next_empty_retry:
+                # Modo de emergencia: el refresco anclado normal se omite
+                # mientras el universo siga vacío, para no "pisar" este reintento.
+                refresh_universe()
+                with symbols_lock:
+                    still_empty = not active_symbols
+                if still_empty:
+                    empty_retry_wait = min(empty_retry_wait * 2, Config.EMPTY_UNIVERSE_RETRY_MAX)
+                    next_empty_retry = now_ts + empty_retry_wait
+                    log.warning("Universo sigue vacío. Próximo reintento en %ss...", empty_retry_wait)
+                else:
+                    next_empty_retry = None
+                    empty_retry_wait = Config.EMPTY_UNIVERSE_RETRY_BASE
+                    log.info("Universo recuperado tras reintento de emergencia.")
+
+            elif not universe_is_empty and now_dt >= next_universe_refresh:
                 refresh_universe()
                 next_universe_refresh = next_universe_refresh_after(now_dt)
+                # Si el refresco anclado dejara el universo vacío por algún
+                # motivo, activar también el modo de reintento de emergencia.
+                with symbols_lock:
+                    if not active_symbols:
+                        next_empty_retry = time.time() + empty_retry_wait
+                        log.warning("El refresco anclado dejó el universo vacío. Activando reintentos de emergencia.")
 
             if now_ts - last_oi_check >= Config.OI_CHECK_INTERVAL:
                 check_oi_cycle()
