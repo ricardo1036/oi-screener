@@ -110,7 +110,7 @@ class Config:
     # OPEN INTEREST — frecuencia de consulta y pausa anti rate-limit
     # ---------------------------------------------------------------------
     OI_CHECK_INTERVAL = 5 * 60        # cada cuánto se recorren TODOS los pares
-    OI_REQUEST_PAUSE = 0.08           # pausa entre cada request de OI (segundos)
+    OI_REQUEST_PAUSE = 0.25           # pausa entre cada request de OI (segundos)
     OI_HISTORY_MAXLEN = 300           # ~25h de histórico a razón de 1 muestra/5min
 
     # Umbrales de variación de OI, evaluados de forma INDEPENDIENTE por
