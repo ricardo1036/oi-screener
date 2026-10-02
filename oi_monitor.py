@@ -1,36 +1,41 @@
 #!/usr/bin/env python3
 """
-================================================================================
- BINANCE FUTURES MONITOR BOT - OI + Volumen (WebSocket + REST híbrido)
-================================================================================
+===============================================================================
+BINANCE FUTURES MONITOR BOT - OI + Volumen (WebSocket + REST híbrido)
+REFACTORIZACIÓN: PATRÓN DISYUNTOR GLOBAL (CIRCUIT BREAKER) ANTI-BAN 418 / 429
+===============================================================================
 Arquitectura (2 capas):
 
-  CAPA 1 — ¿Qué monedas vigilo? (universo dinámico)
-    Se construye a partir de CoinMarketCap (listings/latest): se filtran las
-    monedas dentro de una BANDA de capitalización de mercado configurable
-    (ej. $50M-$500M), se cruzan contra los pares realmente disponibles en
-    Binance Futuros USDT-M, y se exige liquidez mínima (piso absoluto de
-    volumen 24h + ratio Volumen/Market Cap). El match símbolo->proyecto es
-    CONSERVADOR: si un ticker es ambiguo (varios proyectos lo comparten), se
-    descarta en vez de arriesgarse a monitorear el proyecto equivocado.
-    Este universo se refresca en horas ANCLADAS de reloj (UTC), no por
-    intervalo relativo al arranque del bot, para garantizar que esté fresco
-    antes de ventanas horarias específicas (ej. antes de la apertura de NY).
+CAPA 1 — ¿Qué monedas vigilo? (universo dinámico)
+Se construye a partir de CoinMarketCap (listings/latest): se filtran las monedas
+dentro de una BANDA de capitalización de mercado configurable (ej. $50M-$500M),
+se cruzan contra los pares realmente disponibles en Binance Futuros USDT-M, y se
+exige liquidez mínima (piso absoluto de volumen 24h + ratio Volumen/Market Cap).
+El match símbolo->proyecto es CONSERVADOR: si un ticker es ambiguo (varios proyectos
+lo comparten), se descarta en vez de arriesgarse a monitorear el proyecto equivocado.
+Este universo se refresca en horas ANCLADAS de reloj (UTC), no por intervalo relativo
+al arranque del bot, para garantizar que esté fresco antes de ventanas horarias
+específicas (ej. antes de la apertura de NY).
 
-  CAPA 2 — ¿Está pasando algo interesante AHORA en esas monedas?
-    - WebSocket (wss://fstream.binance.com) -> velas de 1 minuto en tiempo
-      real para detectar spikes de volumen y RVOL de corto plazo, sin gastar
-      peso de la API REST de Binance.
-    - REST pública de Binance -> Open Interest, consultado en bucle
-      secuencial con pausa fija entre requests (anti rate-limit).
-    - Telegram con DOS canales: uno urgente (con sonido) para spikes de
-      volumen explosivos, y uno informativo (silencioso) para OI y RVOL.
+CAPA 2 — ¿Está pasando algo interesante AHORA en esas monedas?
+- WebSocket (wss://fstream.binance.com) -> velas de 1 minuto en tiempo real
+  para detectar spikes de volumen y RVOL de corto plazo, sin gastar peso de la
+  API REST de Binance.
+- REST pública de Binance -> Open Interest, consultado en bucle secuencial
+  con pausa fija entre requests (anti rate-limit).
+- Telegram con DOS canales: uno urgente (con sonido) para spikes de volumen
+  explosivos, y uno informativo (silencioso) para OI y RVOL.
 
-No usa API Keys privadas de Binance: solo endpoints públicos de Futuros.
-Sí requiere una API Key gratuita de CoinMarketCap (CMC_API_KEY) para poder
-construir el universo por capitalización de mercado.
-No es asesoría financiera. Uso bajo tu propia responsabilidad.
-================================================================================
+MEJORA IMPLEMENTADA: DISYUNTOR GLOBAL (CIRCUIT BREAKER):
+1. Estado Global de Bloqueo (Cooldown de IP):
+   - Variable `ip_blocked_until` gestionada de forma atómica y thread-safe.
+   - Detección inmediata de HTTP 418 (IP Ban) y HTTP 429 (Rate Limit).
+   - Lectura prioritaria del header `Retry-After` con tope de seguridad configurable.
+2. Bypassing e Interrupción Inmediata:
+   - Verificación de disyuntor al inicio y durante los ciclos de OI y refresco de universo.
+   - Si la IP está en cooldown, no se ejecutan reintentos inútiles símbolo por símbolo.
+   - Emite una sola advertencia clara en logs y aborta el ciclo de inmediato.
+===============================================================================
 """
 
 import os
@@ -41,80 +46,53 @@ import threading
 from collections import deque
 from datetime import datetime, timezone, timedelta
 from http.server import BaseHTTPRequestHandler, HTTPServer
-
 import requests
 import websocket  # pip install websocket-client
 
-
-# ==============================================================================
-# ====================  BLOQUE DE CONFIGURACIÓN (EDITAR AQUÍ)  ================
-# ==============================================================================
+# =============================================================================
+# BLOQUE DE CONFIGURACIÓN (EDITAR AQUÍ)
+# =============================================================================
 class Config:
-    # ---------------------------------------------------------------------
+    # -------------------------------------------------------------------------
     # TELEGRAM — credenciales del bot y de los DOS canales de alertas.
-    # Se recomienda definirlas como variables de entorno en el servidor
-    # (Render, etc.) en vez de escribirlas directamente aquí.
-    # ---------------------------------------------------------------------
+    # -------------------------------------------------------------------------
     TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "PON_TU_TOKEN_AQUI")
-
     # Canal URGENTE: spikes de volumen explosivos en velas de 1m. Suena.
     CHAT_ID_URGENTE = os.environ.get("CHAT_ID_URGENTE", "PON_TU_CHAT_ID_URGENTE")
-
     # Canal INFO: monitor general de Open Interest y RVOL. Silencioso.
     CHAT_ID_INFO = os.environ.get("CHAT_ID_INFO", "PON_TU_CHAT_ID_INFO")
 
-    # ---------------------------------------------------------------------
+    # -------------------------------------------------------------------------
     # BINANCE — endpoints base (públicos, sin API Key)
-    # ---------------------------------------------------------------------
+    # -------------------------------------------------------------------------
     REST_BASE = "https://fapi.binance.com"
     WS_BASE = "wss://fstream.binance.com/stream"
 
-    # ---------------------------------------------------------------------
+    # -------------------------------------------------------------------------
     # COINMARKETCAP — requiere API Key gratuita (pro-api, plan Basic).
-    # Regístrate en https://coinmarketcap.com/api/ y pon la key como
-    # variable de entorno CMC_API_KEY en tu servidor.
-    # ---------------------------------------------------------------------
+    # -------------------------------------------------------------------------
     CMC_API_KEY = os.environ.get("CMC_API_KEY", "")
     CMC_BASE = "https://pro-api.coinmarketcap.com"
 
-    # ---------------------------------------------------------------------
+    # -------------------------------------------------------------------------
     # CAPA 1 — UNIVERSO POR BANDA DE CAPITALIZACIÓN DE MERCADO
-    # ---------------------------------------------------------------------
-    # Banda de market cap a monitorear (ajustable sin tocar lógica).
+    # -------------------------------------------------------------------------
     MIN_MARKET_CAP_USD = 50_000_000
     MAX_MARKET_CAP_USD = 500_000_000
-
-    # Filtro de liquidez en Binance Futuros (red de seguridad, no el criterio
-    # principal): piso absoluto en USD + ratio mínimo Volumen24h/MarketCap.
     MIN_BINANCE_VOLUME_USD = 3_000_000
-    MIN_VOLUME_TO_MCAP_RATIO = 0.05   # 5%: al menos ese % del cap se "rota" en 24h
-
-    # Tamaño del universo descargado de CoinMarketCap antes de filtrar por
-    # banda (grande a propósito: la banda puede caer en cualquier ranking).
+    MIN_VOLUME_TO_MCAP_RATIO = 0.05  # 5%: al menos ese % del cap se "rota" en 24h
     MARKET_UNIVERSE_FETCH_LIMIT = 5000
-
-    # Horas de reloj UTC en las que se refresca el universo (qué monedas se
-    # monitorean). Ancladas a reloj -no a "cada N horas desde el arranque"-
-    # para garantizar frescura antes de ventanas horarias específicas.
-    # Por defecto: cada 6h, con una justo ~2.5-3.5h antes de la apertura de
-    # Nueva York durante todo el año (11:00 UTC), sin necesidad de ajustarla
-    # por cambios de horario (ni de Chile ni de EE.UU.).
     UNIVERSE_REFRESH_HOURS_UTC = [5, 11, 17, 23]
-
-    # Cache del VALOR de Market Cap mostrado en las alertas (no cambia qué
-    # monedas se monitorean, solo mantiene el número fresco). Este sí puede
-    # ser un intervalo simple, no necesita anclarse a horas de reloj.
     MARKET_CAP_DISPLAY_REFRESH_INTERVAL = 30 * 60
 
-    # ---------------------------------------------------------------------
+    # -------------------------------------------------------------------------
     # OPEN INTEREST — frecuencia de consulta y pausa anti rate-limit
-    # ---------------------------------------------------------------------
-    OI_CHECK_INTERVAL = 5 * 60        # cada cuánto se recorren TODOS los pares
-    OI_REQUEST_PAUSE = 0.08           # pausa entre cada request de OI (segundos)
-    OI_HISTORY_MAXLEN = 300           # ~25h de histórico a razón de 1 muestra/5min
+    # -------------------------------------------------------------------------
+    OI_CHECK_INTERVAL = 5 * 60  # cada cuánto se recorren TODOS los pares
+    OI_REQUEST_PAUSE = 0.08      # pausa entre cada request de OI (segundos)
+    OI_HISTORY_MAXLEN = 300     # ~25h de histórico a razón de 1 muestra/5min
 
-    # Umbrales de variación de OI, evaluados de forma INDEPENDIENTE por
-    # temporalidad. Solo se dispara ante SUBIDAS (acumulación), nunca caídas.
+    # Umbrales de variación de OI
     OI_THRESHOLD_5M = 3.0
     OI_THRESHOLD_15M = 5.0
     OI_THRESHOLD_30M = 7.0
@@ -122,75 +100,55 @@ class Config:
     OI_THRESHOLD_4H = 15.0
     OI_THRESHOLD_24H = 20.0
 
-    # ---------------------------------------------------------------------
+    # -------------------------------------------------------------------------
     # DETECTOR DE SPIKES DE VOLUMEN EN VELAS DE 1 MINUTO (canal urgente)
-    # ---------------------------------------------------------------------
-    VOL_SPIKE_THRESHOLD_PCT = 150     # % de exceso sobre el promedio para alertar
-    LOOKBACK_BARS_1M = 10             # nº de velas previas usadas como referencia
+    # -------------------------------------------------------------------------
+    VOL_SPIKE_THRESHOLD_PCT = 150  # % de exceso sobre el promedio para alertar
+    LOOKBACK_BARS_1M = 10          # nº de velas previas usadas como referencia
 
-    # ---------------------------------------------------------------------
+    # -------------------------------------------------------------------------
     # DETECTOR DE RVOL — Volumen Relativo de CORTO PLAZO (canal info)
-    # ---------------------------------------------------------------------
-    # A propósito NO es RVOL "de sesión" (hoy vs. misma hora de ayer): esa
-    # variante exige guardar varios días de historial minuto a minuto y se
-    # resetea en cada reinicio (el bot no tiene almacenamiento persistente).
-    # Esta versión de corto plazo detecta explosiones de volumen frente a
-    # los minutos inmediatamente anteriores, que es justo lo que se busca
-    # para cazar arranques de tendencia en scalping de 1 minuto.
-    RVOL_WINDOW_BARS = 5              # tamaño de la ventana acumulada (minutos)
-    RVOL_THRESHOLD = 2.0              # dispara si RVOL >= 2.0x (200%) lo esperado
+    # -------------------------------------------------------------------------
+    RVOL_WINDOW_BARS = 5   # tamaño de la ventana acumulada (minutos)
+    RVOL_THRESHOLD = 2.0   # dispara si RVOL >= 2.0x (200%) lo esperado
 
-    # ---------------------------------------------------------------------
+    # -------------------------------------------------------------------------
     # ANTI-SPAM (cooldowns independientes por tipo de alerta)
-    # ---------------------------------------------------------------------
+    # -------------------------------------------------------------------------
     SPIKE_ALERT_COOLDOWN = 15 * 60
     OI_ALERT_COOLDOWN = 15 * 60
     RVOL_ALERT_COOLDOWN = 15 * 60
 
-    # ---------------------------------------------------------------------
-    # RED / ROBUSTEZ
-    # ---------------------------------------------------------------------
+    # -------------------------------------------------------------------------
+    # RED / ROBUSTEZ Y CIRCUIT BREAKER (DISYUNTOR GLOBAL)
+    # -------------------------------------------------------------------------
     REQUEST_TIMEOUT = 10
     MAX_RETRIES = 3
     RETRY_BACKOFF_BASE = 2
-
-    # Tope de segundos a esperar cuando Binance/CMC indican el tiempo exacto
-    # de espera vía el header "Retry-After" (418/429). Según la documentación
-    # oficial de Binance, un baneo 418 puede durar de 2 minutos a 3 días; este
-    # tope evita que una sola llamada bloquee el bot por horas.
+    # Tope de segundos a esperar cuando Binance indica el tiempo vía "Retry-After"
     MAX_RETRY_AFTER_WAIT = 120
-
-    # Reintentos más pacientes para llamadas PESADAS de inicialización
-    # (exchangeInfo, listings de CoinMarketCap): se hacen pocas veces al día,
-    # así que no pasa nada si tardan más en recuperarse de un rate-limit.
+    # Tiempo por defecto de enfriamiento si Binance no provee header Retry-After
+    DEFAULT_BAN_COOLDOWN_SECONDS = 60
     HEAVY_MAX_RETRIES = 4
     HEAVY_RETRY_BACKOFF = [5, 15, 30, 60]
-
-    # Si el universo queda vacío (ej. exchangeInfo falló en el arranque), se
-    # reintenta con backoff exponencial creciente en vez de esperar a la
-    # próxima hora ancla (que podría ser hasta 6h después).
-    EMPTY_UNIVERSE_RETRY_BASE = 120     # primer reintento: 2 min
-    EMPTY_UNIVERSE_RETRY_MAX = 1200     # tope: 20 min entre reintentos
-
-    # Servidor HTTP mínimo (necesario para plataformas tipo Render que
-    # exigen un puerto abierto en servicios "Web Service" + keep-alive)
+    EMPTY_UNIVERSE_RETRY_BASE = 120
+    EMPTY_UNIVERSE_RETRY_MAX = 1200
     ENABLE_HEALTH_SERVER = True
 
 
 # Temporalidades de OI a evaluar: nombre -> (segundos, umbral %, tolerancia seg.)
 OI_TIMEFRAMES = {
-    "5m":  (300,   Config.OI_THRESHOLD_5M,  90),
-    "15m": (900,   Config.OI_THRESHOLD_15M, 180),
-    "30m": (1800,  Config.OI_THRESHOLD_30M, 300),
-    "1h":  (3600,  Config.OI_THRESHOLD_1H,  450),
-    "4h":  (14400, Config.OI_THRESHOLD_4H,  900),
+    "5m": (300, Config.OI_THRESHOLD_5M, 90),
+    "15m": (900, Config.OI_THRESHOLD_15M, 180),
+    "30m": (1800, Config.OI_THRESHOLD_30M, 300),
+    "1h": (3600, Config.OI_THRESHOLD_1H, 450),
+    "4h": (14400, Config.OI_THRESHOLD_4H, 900),
     "24h": (86400, Config.OI_THRESHOLD_24H, 1800),
 }
 
-
-# ==============================================================================
+# =============================================================================
 # LOGGING
-# ==============================================================================
+# =============================================================================
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -199,43 +157,96 @@ logging.basicConfig(
 log = logging.getLogger("futures_monitor")
 logging.getLogger("websocket").setLevel(logging.WARNING)
 
-
-# ==============================================================================
-# ESTADO GLOBAL EN MEMORIA
-# ==============================================================================
+# =============================================================================
+# ESTADO GLOBAL EN MEMORIA & DISYUNTOR DE IP (CIRCUIT BREAKER)
+# =============================================================================
 http_session = requests.Session()
-# Nota: este User-Agent es cosmético. Según la documentación oficial de
-# Binance, el HTTP 418 se dispara por volumen de requests por IP (no por
-# fingerprinting de cliente), así que esto no es "la solución" al rate
-# limit -no hace daño tenerlo, pero el fix real es honrar Retry-After.
 http_session.headers.update({
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                  "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 })
 
 symbols_lock = threading.Lock()
-active_symbols = []                 # universo filtrado (banda de market cap + liquidez)
-
-oi_history = {}                     # symbol -> deque[(ts, oi_usdt)]
-kline_volume_history = {}           # symbol -> deque[quote_volume de velas cerradas]
+active_symbols = []  # universo filtrado (banda de market cap + liquidez)
+oi_history = {}      # symbol -> deque[(ts, oi_usdt)]
+kline_volume_history = {}  # symbol -> deque[quote_volume de velas cerradas]
 kline_lock = threading.Lock()
 
-last_spike_alert = {}               # symbol -> ts último alert de spike
-last_oi_alert = {}                  # symbol -> ts último alert de OI
-last_rvol_alert = {}                # symbol -> ts último alert de RVOL
+last_spike_alert = {}  # symbol -> ts último alert de spike
+last_oi_alert = {}     # symbol -> ts último alert de OI
+last_rvol_alert = {}   # symbol -> ts último alert de RVOL
 
-current_ws_app = None               # referencia al WebSocketApp activo
+current_ws_app = None  # referencia al WebSocketApp activo
 ws_restart_lock = threading.Lock()
 
-market_cap_cache = {}               # binance_symbol -> market cap USD (para mostrar en alertas)
-symbol_cmc_id = {}                  # binance_symbol -> id de CoinMarketCap (para refrescos baratos/sin ambigüedad)
+market_cap_cache = {}  # binance_symbol -> market cap USD (para mostrar en alertas)
+symbol_cmc_id = {}     # binance_symbol -> id de CoinMarketCap
 market_cap_lock = threading.Lock()
 
+# -----------------------------------------------------------------------------
+# DISYUNTOR GLOBAL (CIRCUIT BREAKER) PARA BLOQUEOS DE IP (HTTP 418 / 429)
+# -----------------------------------------------------------------------------
+circuit_breaker_lock = threading.Lock()
+ip_blocked_until = None  # datetime | None: marca de tiempo UTC/local hasta la cual no tocar Binance
 
-# ==============================================================================
+
+def is_ip_blocked() -> bool:
+    """
+    Verifica de forma thread-safe si el Disyuntor Global está ACTIVO.
+    Retorna True si la IP está en cooldown por rate limit o ban de Binance.
+    Si el tiempo ya pasó, limpia el estado automáticamente.
+    """
+    global ip_blocked_until
+    with circuit_breaker_lock:
+        if ip_blocked_until is None:
+            return False
+        if datetime.now() < ip_blocked_until:
+            return True
+        # El tiempo de espera ya venció -> Cerramos el disyuntor (IP operativa de nuevo)
+        ip_blocked_until = None
+        log.info("🟢 [DISYUNTOR] Tiempo de cooldown finalizado. Restableciendo llamadas a Binance.")
+        return False
+
+
+def get_blocked_until_time_str() -> str:
+    """Retorna la hora formateada HH:MM:SS de expiración del bloqueo."""
+    with circuit_breaker_lock:
+        if ip_blocked_until is not None:
+            return ip_blocked_until.strftime("%H:%M:%S")
+        return ""
+
+
+def trip_circuit_breaker(wait_seconds: float, status_code: int = 429, source_url: str = ""):
+    """
+    Dispara el Disyuntor Global ante HTTP 418 o 429:
+    1. Calcula el tiempo de enfriamiento (respetando MAX_RETRY_AFTER_WAIT).
+    2. Establece ip_blocked_until = ahora + tiempo_espera.
+    3. Registra una advertencia clara para monitoreo en logs.
+    """
+    global ip_blocked_until
+    cooldown = wait_seconds if (wait_seconds and wait_seconds > 0) else Config.DEFAULT_BAN_COOLDOWN_SECONDS
+    cooldown = min(cooldown, float(Config.MAX_RETRY_AFTER_WAIT))
+    unblock_time = datetime.now() + timedelta(seconds=cooldown)
+
+    with circuit_breaker_lock:
+        if ip_blocked_until is None or unblock_time > ip_blocked_until:
+            ip_blocked_until = unblock_time
+
+    log.warning(
+        "🚨 [DISYUNTOR GLOBAL ACTIVADO] Binance respondió HTTP %s (IP Limit/Ban) en %s. "
+        "Enfriando IP por %.0fs. Todas las llamadas a Binance quedan bloqueadas hasta las %s.",
+        status_code,
+        source_url or "Binance Futures REST",
+        cooldown,
+        unblock_time.strftime("%H:%M:%S")
+    )
+
+
+# =============================================================================
 # HELPERS GENERALES
-# ==============================================================================
+# =============================================================================
 def format_usd(value):
+    if value is None:
+        return "$0.00"
     if value >= 1_000_000_000:
         return f"${value / 1_000_000_000:.2f}B"
     if value >= 1_000_000:
@@ -256,50 +267,80 @@ def base_asset(symbol):
 
 
 def _resolve_wait_time(resp, attempt, fallback_backoff):
-    """Decide cuánto esperar ante un 418/429: prioriza el header Retry-After
+    """
+    Decide cuánto esperar ante un 418/429: prioriza el header Retry-After
     (Binance/CMC indican ahí el tiempo EXACTO necesario, incluyendo cuánto
-    falta para que termine un baneo 418) en vez de adivinar con un backoff
-    fijo. Si el header no viene, cae al backoff de respaldo."""
+    falta para que termine un baneo 418) en vez de adivinar con un backoff fijo.
+    Si el header no viene, cae al backoff de respaldo o al valor por defecto.
+    """
     retry_after = resp.headers.get("Retry-After")
     if retry_after:
         try:
             return min(float(retry_after), Config.MAX_RETRY_AFTER_WAIT)
         except ValueError:
             pass
-    return fallback_backoff[min(attempt - 1, len(fallback_backoff) - 1)]
+    if fallback_backoff and len(fallback_backoff) > 0:
+        return fallback_backoff[min(attempt - 1, len(fallback_backoff) - 1)]
+    return Config.DEFAULT_BAN_COOLDOWN_SECONDS
 
 
 def http_get_json(url, params=None, headers=None, max_retries=None, fallback_backoff=None):
-    """GET con reintentos. Devuelve None si falla todo.
-    max_retries/fallback_backoff permiten dar más paciencia a llamadas
-    pesadas de inicialización (ver Config.HEAVY_MAX_RETRIES)."""
+    """
+    GET con reintentos e integración con Disyuntor Global.
+    Devuelve None si la IP está bloqueada, si falla todo o si se dispara un 418/429.
+    """
+    is_binance = Config.REST_BASE in url
+
+    # 1. BYPASSING PREVENTIVO: Si la IP de Binance está actualmente en cooldown,
+    # no tocar la API bajo ninguna circunstancia.
+    if is_binance and is_ip_blocked():
+        log.warning(
+            "⚠️ IP bloqueada por Binance. Omitiendo petición a %s hasta %s para enfriar la IP.",
+            url, get_blocked_until_time_str()
+        )
+        return None
+
     attempts = max_retries or Config.MAX_RETRIES
     backoff = fallback_backoff or [Config.RETRY_BACKOFF_BASE ** i for i in range(1, attempts + 1)]
 
     for attempt in range(1, attempts + 1):
+        if is_binance and is_ip_blocked():
+            return None
+
         try:
             resp = http_session.get(url, params=params, headers=headers, timeout=Config.REQUEST_TIMEOUT)
+
             if resp.status_code == 200:
                 return resp.json()
+
             if resp.status_code in (429, 418):
                 wait = _resolve_wait_time(resp, attempt, backoff)
+
+                # Si Binance devuelve 418 o 429, activamos el Disyuntor Global y NO seguimos reintentando
+                if is_binance:
+                    trip_circuit_breaker(wait_seconds=wait, status_code=resp.status_code, source_url=url)
+                    return None  # Abortar inmediatamente esta llamada
+
+                # Si es otra API (ej. CoinMarketCap)
                 log.warning("Rate limit (status %s) en %s. Esperando %.0fs...", resp.status_code, url, wait)
                 time.sleep(wait)
             else:
                 log.warning("Respuesta inesperada (status %s) en %s", resp.status_code, url)
                 time.sleep(Config.RETRY_BACKOFF_BASE)
+
         except requests.exceptions.RequestException as e:
             wait = backoff[min(attempt - 1, len(backoff) - 1)]
-            log.warning("Error de red (%s) en %s [intento %s/%s]. Reintentando en %ss...",
-                        e, url, attempt, attempts, wait)
+            log.warning(
+                "Error de red (%s) en %s [intento %s/%s]. Reintentando en %ss...",
+                e, url, attempt, attempts, wait
+            )
             time.sleep(wait)
+
     log.error("Fallaron todos los reintentos para %s", url)
     return None
 
 
 def find_closest_sample(history, target_seconds_ago, tolerance):
-    """Busca en el histórico la muestra más cercana a 'target_seconds_ago'
-    dentro de una tolerancia (segundos). Devuelve (ts, valor) o None."""
     now = time.time()
     target_ts = now - target_seconds_ago
     best, best_diff = None, None
@@ -310,14 +351,13 @@ def find_closest_sample(history, target_seconds_ago, tolerance):
     return best
 
 
-# ==============================================================================
+# =============================================================================
 # TELEGRAM (doble canal)
-# ==============================================================================
+# =============================================================================
 def send_telegram(text, chat_id, silent=False):
     if "PON_TU" in Config.TELEGRAM_TOKEN or "PON_TU" in str(chat_id):
         log.warning("Telegram no configurado (token/chat_id por defecto). Mensaje no enviado.")
         return False
-
     url = f"https://api.telegram.org/bot{Config.TELEGRAM_TOKEN}/sendMessage"
     payload = {
         "chat_id": chat_id,
@@ -345,16 +385,23 @@ def send_info_alert(text):
     return send_telegram(text, Config.CHAT_ID_INFO, silent=True)
 
 
-# ==============================================================================
-# BINANCE REST: exchangeInfo + tickers 24h (insumos para el universo y el OI)
-# ==============================================================================
+# =============================================================================
+# BINANCE REST: exchangeInfo + tickers 24h
+# =============================================================================
 def fetch_exchange_info(heavy=False):
-    """Devuelve el set de símbolos USDT-M PERPETUAL actualmente TRADING en Binance.
-    heavy=True usa el backoff más paciente (llamada de inicialización, poco frecuente)."""
-    kwargs = {"max_retries": Config.HEAVY_MAX_RETRIES, "fallback_backoff": Config.HEAVY_RETRY_BACKOFF} if heavy else {}
+    """Devuelve el set de símbolos USDT-M PERPETUAL actualmente TRADING en Binance."""
+    if is_ip_blocked():
+        return None
+
+    kwargs = {
+        "max_retries": Config.HEAVY_MAX_RETRIES,
+        "fallback_backoff": Config.HEAVY_RETRY_BACKOFF,
+    } if heavy else {}
+
     data = http_get_json(f"{Config.REST_BASE}/fapi/v1/exchangeInfo", **kwargs)
     if not data:
         return None
+
     symbols = set()
     for s in data.get("symbols", []):
         if (
@@ -367,11 +414,19 @@ def fetch_exchange_info(heavy=False):
 
 
 def fetch_24h_tickers(heavy=False):
-    """heavy=True usa el backoff más paciente (llamada de inicialización, poco frecuente)."""
-    kwargs = {"max_retries": Config.HEAVY_MAX_RETRIES, "fallback_backoff": Config.HEAVY_RETRY_BACKOFF} if heavy else {}
+    """Obtiene los precios y volúmenes 24h de futuros Binance."""
+    if is_ip_blocked():
+        return None
+
+    kwargs = {
+        "max_retries": Config.HEAVY_MAX_RETRIES,
+        "fallback_backoff": Config.HEAVY_RETRY_BACKOFF,
+    } if heavy else {}
+
     data = http_get_json(f"{Config.REST_BASE}/fapi/v1/ticker/24hr", **kwargs)
     if not data:
         return None
+
     result = {}
     for item in data:
         try:
@@ -384,17 +439,14 @@ def fetch_24h_tickers(heavy=False):
     return result
 
 
-# ==============================================================================
+# =============================================================================
 # COINMARKETCAP: universo por capitalización + cache de Market Cap
-# ==============================================================================
+# =============================================================================
 def cmc_headers():
     return {"X-CMC_PRO_API_KEY": Config.CMC_API_KEY, "Accept": "application/json"}
 
 
 def fetch_cmc_listings(limit):
-    """Descarga un lote grande de CoinMarketCap ordenado por market cap, para
-    poder filtrar después por banda (la banda puede caer en cualquier rango
-    de ranking, no necesariamente en el Top 200)."""
     if not Config.CMC_API_KEY:
         log.error("CMC_API_KEY no configurada. No se puede refrescar el universo.")
         return None
@@ -411,8 +463,6 @@ def fetch_cmc_listings(limit):
 
 
 def fetch_cmc_quotes_by_id(ids):
-    """Refresco barato y SIN ambigüedad: consulta por ID de CoinMarketCap
-    (único por definición), no por símbolo."""
     if not ids or not Config.CMC_API_KEY:
         return None
     data = http_get_json(
@@ -426,17 +476,24 @@ def fetch_cmc_quotes_by_id(ids):
 
 
 def refresh_universe():
-    """CAPA 1: reconstruye qué monedas se monitorean.
-    1) Descarga un lote grande de CoinMarketCap.
-    2) Descarta tickers ambiguos (varios proyectos con el mismo símbolo).
-    3) Filtra por banda de market cap.
-    4) Cruza contra los pares realmente activos en Binance Futuros USDT-M.
-    5) Exige liquidez mínima (piso absoluto + ratio Volumen/MarketCap).
-    Si algo falla, se mantiene el universo anterior (nunca se vacía por un
-    error puntual de red)."""
-    log.info("Refrescando universo por capitalización de mercado (CoinMarketCap)...")
+    """
+    CAPA 1: reconstruye qué monedas se monitorean.
+    Protegido con Disyuntor Global: si la IP está bloqueada, aborta sin tocar Binance.
+    """
+    if is_ip_blocked():
+        log.warning(
+            "⚠️ IP bloqueada por Binance. Omitiendo refresco de universo hasta %s para enfriar la IP.",
+            get_blocked_until_time_str()
+        )
+        return
 
+    log.info("Refrescando universo por capitalización de mercado (CoinMarketCap)...")
     listings = fetch_cmc_listings(Config.MARKET_UNIVERSE_FETCH_LIMIT)
+
+    if is_ip_blocked():
+        log.warning("⚠️ IP bloqueada por Binance. Omitiendo llamadas a Binance exchangeInfo.")
+        return
+
     valid_binance_symbols = fetch_exchange_info(heavy=True)
     tickers = fetch_24h_tickers(heavy=True)
 
@@ -444,7 +501,6 @@ def refresh_universe():
         log.error("No se pudo refrescar el universo (CMC/Binance no respondió). Se mantiene el anterior.")
         return
 
-    # --- Agrupar por símbolo para detectar ambigüedad ---
     symbol_entries = {}
     for item in listings:
         try:
@@ -458,16 +514,14 @@ def refresh_universe():
 
     ambiguous_count = sum(1 for entries in symbol_entries.values() if len(entries) > 1)
 
-    # --- Solo tickers únicos y dentro de la banda de capitalización ---
     band_candidates = {}
     for sym, entries in symbol_entries.items():
         if len(entries) != 1:
-            continue  # ambiguo: se descarta (match conservador)
+            continue
         cmc_id, mcap = entries[0]
         if Config.MIN_MARKET_CAP_USD <= mcap <= Config.MAX_MARKET_CAP_USD:
             band_candidates[sym] = (cmc_id, mcap)
 
-    # --- Intersección con Binance Futuros + filtro de liquidez ---
     new_symbols = []
     new_market_caps = {}
     new_cmc_ids = {}
@@ -483,10 +537,8 @@ def refresh_universe():
         if not t:
             continue
         binance_volume = t["quote_volume"]
-
         if binance_volume < Config.MIN_BINANCE_VOLUME_USD:
             continue
-
         ratio = (binance_volume / mcap) if mcap > 0 else 0.0
         if ratio < Config.MIN_VOLUME_TO_MCAP_RATIO:
             continue
@@ -508,8 +560,12 @@ def refresh_universe():
     log.info(
         "Universo actualizado: %s pares | banda $%s-$%s | ratio vol/mcap >= %.0f%% | "
         "piso vol >= %s | %s tickers ambiguos descartados.",
-        len(new_symbols), format_usd(Config.MIN_MARKET_CAP_USD), format_usd(Config.MAX_MARKET_CAP_USD),
-        Config.MIN_VOLUME_TO_MCAP_RATIO * 100, format_usd(Config.MIN_BINANCE_VOLUME_USD), ambiguous_count,
+        len(new_symbols),
+        format_usd(Config.MIN_MARKET_CAP_USD),
+        format_usd(Config.MAX_MARKET_CAP_USD),
+        Config.MIN_VOLUME_TO_MCAP_RATIO * 100,
+        format_usd(Config.MIN_BINANCE_VOLUME_USD),
+        ambiguous_count,
     )
 
     if changed:
@@ -517,10 +573,6 @@ def refresh_universe():
 
 
 def refresh_market_cap_display():
-    """Refresca SOLO el valor de Market Cap mostrado en las tarjetas de
-    Telegram, para los símbolos ya activos. No cambia qué monedas se
-    monitorean (eso lo hace refresh_universe). Usa ID de CMC: sin ambigüedad
-    posible porque el ID es único por definición."""
     with market_cap_lock:
         ids_by_symbol = dict(symbol_cmc_id)
 
@@ -555,7 +607,6 @@ def get_market_cap(symbol):
 
 
 def run_market_cap_display_refresher():
-    """Hilo de fondo: refresca el valor de Market Cap cada MARKET_CAP_DISPLAY_REFRESH_INTERVAL."""
     while True:
         try:
             refresh_market_cap_display()
@@ -565,10 +616,6 @@ def run_market_cap_display_refresher():
 
 
 def next_universe_refresh_after(dt):
-    """Devuelve el próximo datetime UTC (de UNIVERSE_REFRESH_HOURS_UTC)
-    estrictamente posterior a dt. Anclar a horas de reloj (en vez de 'cada N
-    horas desde el arranque') garantiza frescura antes de ventanas horarias
-    específicas, sin importar cuándo se reinicie el bot."""
     candidates = []
     for h in Config.UNIVERSE_REFRESH_HOURS_UTC:
         candidate = dt.replace(hour=h, minute=0, second=0, microsecond=0)
@@ -578,11 +625,16 @@ def next_universe_refresh_after(dt):
     return min(candidates)
 
 
-# ==============================================================================
-# BINANCE REST: OPEN INTEREST (bucle secuencial con pausa anti rate-limit)
-# ==============================================================================
+# =============================================================================
+# BINANCE REST: OPEN INTEREST (Bucle protegido por Disyuntor Global)
+# =============================================================================
 def fetch_open_interest(symbol):
-    data = http_get_json(f"{Config.REST_BASE}/fapi/v1/openInterest", params={"symbol": symbol})
+    if is_ip_blocked():
+        return None
+    data = http_get_json(
+        f"{Config.REST_BASE}/fapi/v1/openInterest",
+        params={"symbol": symbol}
+    )
     if not data:
         return None
     try:
@@ -592,26 +644,17 @@ def fetch_open_interest(symbol):
 
 
 def evaluate_oi_timeframes(symbol, hist, oi_usdt):
-    """Evalúa el cambio de OI contra CADA temporalidad de forma independiente.
-    Solo dispara ante SUBIDAS de OI (acumulación) — las caídas se ignoran a
-    propósito, ya que el objetivo es detectar entradas de dinero, no salidas.
-    Devuelve una lista de tuplas (label, pct_change) de las que superaron su umbral."""
     triggered = []
     for label, (secs, threshold, tolerance) in OI_TIMEFRAMES.items():
         sample = find_closest_sample(hist, secs, tolerance)
         if sample and sample[1] > 0:
             change = (oi_usdt - sample[1]) / sample[1] * 100
-            if change >= threshold:  # solo variación POSITIVA (acumulación de OI)
+            if change >= threshold:
                 triggered.append((label, change))
     return triggered
 
 
 def compute_rvol_1m(symbol):
-    """RVOL 'Fórmula Tipo 1': volumen de la ÚLTIMA vela cerrada de 1m vs. el
-    promedio de las LOOKBACK_BARS_1M velas inmediatamente anteriores (la
-    misma lógica que usa el detector de spikes). Devuelve None si todavía no
-    hay historial suficiente (ej. tras un reinicio reciente del bot), para
-    que la tarjeta de alerta simplemente omita esa línea."""
     with kline_lock:
         hist = kline_volume_history.get(symbol)
         if not hist or len(hist) < Config.LOOKBACK_BARS_1M + 1:
@@ -636,7 +679,7 @@ def process_symbol_oi(symbol, price, quote_volume):
     hist = oi_history.setdefault(symbol, deque(maxlen=Config.OI_HISTORY_MAXLEN))
 
     triggered = evaluate_oi_timeframes(symbol, hist, oi_usdt)
-    hist.append((now, oi_usdt))  # guardar DESPUÉS de comparar, para no compararse consigo mismo
+    hist.append((now, oi_usdt))
 
     if not triggered:
         return
@@ -645,15 +688,9 @@ def process_symbol_oi(symbol, price, quote_volume):
     if now - last_sent < Config.OI_ALERT_COOLDOWN:
         return
 
-    # Todas las alertas triggered son subidas (ver evaluate_oi_timeframes), así
-    # que el marcador siempre es verde.
     lines = "\n".join(f"• *{label}:* 🟢 +{chg:.2f}%" for label, chg in triggered)
-
     mcap = get_market_cap(symbol)
     mcap_line = f"*Market Cap:* {format_usd(mcap)}\n" if mcap else ""
-
-    # Ratio OI/Volumen 24h: qué tan grande es el Open Interest en relación al
-    # volumen negociado en el día.
     oi_vol_ratio = (oi_usdt / quote_volume * 100) if quote_volume > 0 else 0.0
 
     rvol_1m = compute_rvol_1m(symbol)
@@ -670,14 +707,29 @@ def process_symbol_oi(symbol, price, quote_volume):
         f"{rvol_line}"
         f"\n📊 [Ver en TradingView]({tradingview_link(symbol)})"
     )
+
     if send_info_alert(msg):
         last_oi_alert[symbol] = now
         log.info("Alerta OI enviada -> %s | %s", symbol, [l for l, _ in triggered])
 
 
 def check_oi_cycle():
-    """Recorre TODOS los pares activos de forma SECUENCIAL, con una pausa fija
-    entre cada request para evitar bloqueos/HTTP 418/429 de Binance."""
+    """
+    Recorre TODOS los pares activos de forma SECUENCIAL con pausa fija.
+    
+    IMPLEMENTACIÓN DEL DISYUNTOR GLOBAL:
+    a) Si datetime.now() < ip_blocked_until, emite un único log claro y cancela el ciclo completo.
+    b) Si durante el recorrido por los 85 símbolos alguno recibe 418/429, el disyuntor se activa
+       y se interrumpe de inmediato el bucle, evitando peticiones subsecuentes inútiles.
+    """
+    # 1. Comprobación PREVIA del Disyuntor Global
+    if is_ip_blocked():
+        log.warning(
+            "⚠️ IP bloqueada por Binance. Omitiendo ciclo de Open Interest hasta %s para enfriar la IP.",
+            get_blocked_until_time_str()
+        )
+        return
+
     with symbols_lock:
         symbols_snapshot = list(active_symbols)
 
@@ -692,42 +744,55 @@ def check_oi_cycle():
 
     start = time.time()
     processed = 0
+
     for symbol in symbols_snapshot:
+        # 2. Interrupción INMEDIATA si el disyuntor se activó en una llamada previa del ciclo
+        if is_ip_blocked():
+            log.warning(
+                "⚠️ IP bloqueada por Binance durante el ciclo de OI. Interrumpiendo recorrido "
+                "(%s/%s procesados) hasta %s para enfriar la IP.",
+                processed, len(symbols_snapshot), get_blocked_until_time_str()
+            )
+            break
+
         t = tickers.get(symbol)
         if not t:
             continue
+
         try:
             process_symbol_oi(symbol, t["price"], t["quote_volume"])
             processed += 1
         except Exception as e:
             log.exception("Error procesando OI de %s: %s", symbol, e)
-        time.sleep(Config.OI_REQUEST_PAUSE)  # <-- pausa anti rate-limit
 
-    log.info("Ciclo de OI completado: %s/%s pares procesados en %.1fs.",
-              processed, len(symbols_snapshot), time.time() - start)
+        time.sleep(Config.OI_REQUEST_PAUSE)
+
+    log.info(
+        "Ciclo de OI completado: %s/%s pares procesados en %.1fs.",
+        processed,
+        len(symbols_snapshot),
+        time.time() - start
+    )
 
 
-# ==============================================================================
-# WEBSOCKET: VELAS DE 1 MINUTO (spikes de volumen + RVOL de corto plazo)
-# ==============================================================================
+# =============================================================================
+# WEBSOCKET: VELAS DE 1 MINUTO
+# =============================================================================
 def build_stream_url(symbols):
     streams = "/".join(f"{s.lower()}@kline_1m" for s in symbols)
     return f"{Config.WS_BASE}?streams={streams}"
 
 
 def evaluate_volume_bar(symbol, quote_volume):
-    """Usa el histórico REAL de barras cerradas guardado en memoria (deque),
-    calculado ANTES de insertar la barra actual (nunca se compara una vela
-    consigo misma)."""
     with kline_lock:
         hist = kline_volume_history.setdefault(
-            symbol, deque(maxlen=max(Config.LOOKBACK_BARS_1M, Config.RVOL_WINDOW_BARS) + 5)
+            symbol,
+            deque(maxlen=max(Config.LOOKBACK_BARS_1M, Config.RVOL_WINDOW_BARS) + 5)
         )
-        hist_snapshot = list(hist)  # copia para no bloquear mientras evaluamos
+        hist_snapshot = list(hist)
 
     now = time.time()
 
-    # ---------------- SPIKE DETECTOR (canal urgente) ----------------
     if len(hist_snapshot) >= Config.LOOKBACK_BARS_1M:
         reference_bars = hist_snapshot[-Config.LOOKBACK_BARS_1M:]
         avg_vol = sum(reference_bars) / len(reference_bars)
@@ -748,27 +813,29 @@ def evaluate_volume_bar(symbol, quote_volume):
                         last_spike_alert[symbol] = now
                         log.info("Alerta SPIKE enviada -> %s | +%.0f%%", symbol, spike_pct)
 
-            # ---------------- RVOL DETECTOR corto plazo (canal info) ----------------
-            if len(hist_snapshot) >= Config.RVOL_WINDOW_BARS - 1:
-                window = hist_snapshot[-(Config.RVOL_WINDOW_BARS - 1):] + [quote_volume]
-                actual_sum = sum(window)
-                expected_sum = avg_vol * Config.RVOL_WINDOW_BARS
-                if expected_sum > 0:
-                    rvol = actual_sum / expected_sum
-                    if rvol >= Config.RVOL_THRESHOLD:
-                        last_sent_rvol = last_rvol_alert.get(symbol, 0)
-                        if now - last_sent_rvol >= Config.RVOL_ALERT_COOLDOWN:
-                            msg = (
-                                f"📊 *RVOL ANÓMALO*\n\n"
-                                f"*Par:* #{symbol}\n"
-                                f"*RVOL:* {rvol:.2f}x\n"
-                                f"*Volumen acumulado ({Config.RVOL_WINDOW_BARS}m):* {format_usd(actual_sum)}\n"
-                                f"*Volumen esperado:* {format_usd(expected_sum)}\n\n"
-                                f"📊 [Ver en TradingView]({tradingview_link(symbol)})"
-                            )
-                            if send_info_alert(msg):
-                                last_rvol_alert[symbol] = now
-                                log.info("Alerta RVOL enviada -> %s | %.2fx", symbol, rvol)
+    if len(hist_snapshot) >= Config.RVOL_WINDOW_BARS - 1:
+        window = hist_snapshot[-(Config.RVOL_WINDOW_BARS - 1):] + [quote_volume]
+        actual_sum = sum(window)
+        reference_bars = hist_snapshot[-Config.LOOKBACK_BARS_1M:] if len(hist_snapshot) >= Config.LOOKBACK_BARS_1M else hist_snapshot
+        avg_vol = sum(reference_bars) / len(reference_bars) if reference_bars else 0
+        expected_sum = avg_vol * Config.RVOL_WINDOW_BARS
+
+        if expected_sum > 0:
+            rvol = actual_sum / expected_sum
+            if rvol >= Config.RVOL_THRESHOLD:
+                last_sent_rvol = last_rvol_alert.get(symbol, 0)
+                if now - last_sent_rvol >= Config.RVOL_ALERT_COOLDOWN:
+                    msg = (
+                        f"📊 *RVOL ANÓMALO*\n\n"
+                        f"*Par:* #{symbol}\n"
+                        f"*RVOL:* {rvol:.2f}x\n"
+                        f"*Volumen acumulado ({Config.RVOL_WINDOW_BARS}m):* {format_usd(actual_sum)}\n"
+                        f"*Volumen esperado:* {format_usd(expected_sum)}\n\n"
+                        f"📊 [Ver en TradingView]({tradingview_link(symbol)})"
+                    )
+                    if send_info_alert(msg):
+                        last_rvol_alert[symbol] = now
+                        log.info("Alerta RVOL enviada -> %s | %.2fx", symbol, rvol)
 
     with kline_lock:
         hist.append(quote_volume)
@@ -781,7 +848,7 @@ def on_ws_message(ws, message):
         if data.get("e") != "kline":
             return
         k = data.get("k", {})
-        if not k.get("x"):  # solo procesar velas CERRADAS
+        if not k.get("x"):
             return
         symbol = k.get("s")
         quote_volume = float(k.get("q", 0))
@@ -804,8 +871,6 @@ def on_ws_open(ws):
 
 
 def restart_websocket():
-    """Fuerza el cierre del WebSocket activo para que el hilo lo reconstruya
-    con la lista de símbolos actualizada."""
     with ws_restart_lock:
         global current_ws_app
         if current_ws_app is not None:
@@ -816,8 +881,6 @@ def restart_websocket():
 
 
 def run_websocket_forever():
-    """Hilo de fondo: mantiene el WebSocket vivo y lo reconecta ante cualquier
-    caída o cambio en la lista de símbolos monitoreados."""
     global current_ws_app
     while True:
         with symbols_lock:
@@ -829,7 +892,6 @@ def run_websocket_forever():
 
         url = build_stream_url(symbols_snapshot)
         log.info("Conectando WebSocket con %s streams de velas 1m...", len(symbols_snapshot))
-
         ws_app = websocket.WebSocketApp(
             url,
             on_open=on_ws_open,
@@ -838,26 +900,32 @@ def run_websocket_forever():
             on_close=on_ws_close,
         )
         current_ws_app = ws_app
-
         try:
             ws_app.run_forever(ping_interval=180, ping_timeout=10)
         except Exception as e:
             log.exception("Excepción en WebSocket run_forever: %s", e)
 
-        time.sleep(5)  # pequeño backoff antes de reconectar
+        time.sleep(5)
 
 
-# ==============================================================================
-# SERVIDOR HTTP MÍNIMO (keep-alive para Render u otras plataformas)
-# ==============================================================================
+# =============================================================================
+# SERVIDOR HTTP MÍNIMO (keep-alive para Render)
+# =============================================================================
 class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
-        self.send_header("Content-type", "text/plain")
+        self.send_header("Content-type", "text/plain; charset=utf-8")
         self.end_headers()
         with symbols_lock:
             n = len(active_symbols)
-        self.wfile.write(f"OK - Futures Monitor Bot activo. Pares monitoreados: {n}".encode())
+        
+        status_cb = (
+            f"DISYUNTOR ACTIVO (IP en enfriamiento hasta las {get_blocked_until_time_str()})"
+            if is_ip_blocked()
+            else "NORMAL (IP limpia)"
+        )
+        body = f"OK - Futures Monitor Bot activo. Pares monitoreados: {n} | Estado IP Binance: {status_cb}\n"
+        self.wfile.write(body.encode("utf-8"))
 
     def log_message(self, format, *args):
         pass
@@ -870,44 +938,55 @@ def start_health_server():
     server.serve_forever()
 
 
-# ==============================================================================
+# =============================================================================
 # LOOP PRINCIPAL
-# ==============================================================================
+# =============================================================================
 def main():
-    log.info("=== Iniciando Binance Futures Monitor Bot (universo por market cap + WebSocket + REST) ===")
+    log.info("=== Iniciando Binance Futures Monitor Bot (Circuit Breaker Edition) ===")
     log.info(
         "Universo: banda $%s-$%s | ratio vol/mcap >= %.0f%% | piso vol >= %s | anclas UTC %s",
-        format_usd(Config.MIN_MARKET_CAP_USD), format_usd(Config.MAX_MARKET_CAP_USD),
-        Config.MIN_VOLUME_TO_MCAP_RATIO * 100, format_usd(Config.MIN_BINANCE_VOLUME_USD),
+        format_usd(Config.MIN_MARKET_CAP_USD),
+        format_usd(Config.MAX_MARKET_CAP_USD),
+        Config.MIN_VOLUME_TO_MCAP_RATIO * 100,
+        format_usd(Config.MIN_BINANCE_VOLUME_USD),
         Config.UNIVERSE_REFRESH_HOURS_UTC,
     )
     log.info(
         "Spike: >=%.0f%% sobre %s velas | RVOL: >=%.1fx sobre %s velas | "
-        "OI umbrales 5m/15m/30m/1h/4h/24h = %.1f/%.1f/%.1f/%.1f/%.1f/%.1f %%",
-        Config.VOL_SPIKE_THRESHOLD_PCT, Config.LOOKBACK_BARS_1M,
-        Config.RVOL_THRESHOLD, Config.RVOL_WINDOW_BARS,
-        Config.OI_THRESHOLD_5M, Config.OI_THRESHOLD_15M, Config.OI_THRESHOLD_30M,
-        Config.OI_THRESHOLD_1H, Config.OI_THRESHOLD_4H, Config.OI_THRESHOLD_24H,
+        "OI umbrales 5m/15m/30m/1h/4h/24h = %.1f/%.1f/%.1f/%.1f/%.1f/%.1f%%",
+        Config.VOL_SPIKE_THRESHOLD_PCT,
+        Config.LOOKBACK_BARS_1M,
+        Config.RVOL_THRESHOLD,
+        Config.RVOL_WINDOW_BARS,
+        Config.OI_THRESHOLD_5M,
+        Config.OI_THRESHOLD_15M,
+        Config.OI_THRESHOLD_30M,
+        Config.OI_THRESHOLD_1H,
+        Config.OI_THRESHOLD_4H,
+        Config.OI_THRESHOLD_24H,
+    )
+    log.info(
+        "Disyuntor Global configurado: MAX_RETRY_AFTER_WAIT=%ss, DEFAULT_COOLDOWN=%ss",
+        Config.MAX_RETRY_AFTER_WAIT,
+        Config.DEFAULT_BAN_COOLDOWN_SECONDS,
     )
 
     if Config.ENABLE_HEALTH_SERVER:
         threading.Thread(target=start_health_server, daemon=True).start()
 
-    refresh_universe()  # primera carga del universo (dispara conexión WS más abajo)
+    refresh_universe()  # primera carga del universo
 
     threading.Thread(target=run_websocket_forever, daemon=True).start()
     threading.Thread(target=run_market_cap_display_refresher, daemon=True).start()
 
-    send_info_alert("✅ *Futures Monitor Bot iniciado correctamente.*")
+    send_info_alert("✅ *Futures Monitor Bot iniciado correctamente con Circuit Breaker.*")
 
     next_universe_refresh = next_universe_refresh_after(datetime.now(timezone.utc))
     last_oi_check = 0  # forzar primera ejecución inmediata
 
-    # --- Red de seguridad: si el universo queda vacío (ej. exchangeInfo o
-    # CMC fallaron en el arranque), reintentar con backoff creciente en vez
-    # de esperar a la próxima hora ancla (que podría ser hasta 6h después). ---
     empty_retry_wait = Config.EMPTY_UNIVERSE_RETRY_BASE
     next_empty_retry = None
+
     with symbols_lock:
         if not active_symbols:
             next_empty_retry = time.time() + empty_retry_wait
@@ -922,11 +1001,19 @@ def main():
                 universe_is_empty = not active_symbols
 
             if universe_is_empty and next_empty_retry and now_ts >= next_empty_retry:
-                # Modo de emergencia: el refresco anclado normal se omite
-                # mientras el universo siga vacío, para no "pisar" este reintento.
+                # Si la IP está bloqueada, postergar reintento de emergencia sin saturar
+                if is_ip_blocked():
+                    log.warning(
+                        "⚠️ IP bloqueada. Postergando reintento de universo de emergencia hasta %s.",
+                        get_blocked_until_time_str()
+                    )
+                    time.sleep(10)
+                    continue
+
                 refresh_universe()
                 with symbols_lock:
                     still_empty = not active_symbols
+
                 if still_empty:
                     empty_retry_wait = min(empty_retry_wait * 2, Config.EMPTY_UNIVERSE_RETRY_MAX)
                     next_empty_retry = now_ts + empty_retry_wait
@@ -937,14 +1024,18 @@ def main():
                     log.info("Universo recuperado tras reintento de emergencia.")
 
             elif not universe_is_empty and now_dt >= next_universe_refresh:
-                refresh_universe()
-                next_universe_refresh = next_universe_refresh_after(now_dt)
-                # Si el refresco anclado dejara el universo vacío por algún
-                # motivo, activar también el modo de reintento de emergencia.
-                with symbols_lock:
-                    if not active_symbols:
-                        next_empty_retry = time.time() + empty_retry_wait
-                        log.warning("El refresco anclado dejó el universo vacío. Activando reintentos de emergencia.")
+                if not is_ip_blocked():
+                    refresh_universe()
+                    next_universe_refresh = next_universe_refresh_after(now_dt)
+                    with symbols_lock:
+                        if not active_symbols:
+                            next_empty_retry = time.time() + empty_retry_wait
+                            log.warning("El refresco anclado dejó el universo vacío. Activando reintentos de emergencia.")
+                else:
+                    log.warning(
+                        "⚠️ IP bloqueada. Postergando refresco anclado hasta %s.",
+                        get_blocked_until_time_str()
+                    )
 
             if now_ts - last_oi_check >= Config.OI_CHECK_INTERVAL:
                 check_oi_cycle()
